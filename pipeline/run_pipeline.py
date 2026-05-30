@@ -138,7 +138,7 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
 
     stt = WhisperSTTService(model_size="base.en", device="cuda")
     llm = OpenAILLM()
-    tts = QwenTTSService(language="English", device="cuda", model_name="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+    tts = QwenTTSService(language="English", device="cuda")
 
     pipeline = Pipeline([
         transport.input(),
