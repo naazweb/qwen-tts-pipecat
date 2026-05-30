@@ -28,42 +28,15 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.runner.run import main as runner_main, app as pipecat_app
+from pipecat.runner.run import main as runner_main
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 from openai import AsyncOpenAI
 from tts_service import QwenTTSService
-
-
-ICE_SERVERS = [
-    {
-        "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
-        "username": "openrelayproject",
-        "credential": "openrelayproject",
-    },
-    {"urls": ["stun:stun.l.google.com:19302"]},
-]
-
-
-@pipecat_app.post("/start", include_in_schema=False)
-async def start_with_ice(request: Request):
-    import uuid
-    session_id = str(uuid.uuid4())
-    # Store session so /api/offer proxy works
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    return JSONResponse({
-        "sessionId": session_id,
-        "iceConfig": {"iceServers": ICE_SERVERS},
-    })
 
 transport_params = {
     "webrtc": lambda: TransportParams(
