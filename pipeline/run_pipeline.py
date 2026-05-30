@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     EndFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
     TextFrame, TranscriptionFrame,
@@ -106,7 +107,7 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.3, start_secs=0.1, confidence=0.4)),
             audio_out_sample_rate=24000,
         ),
     )
