@@ -1,35 +1,36 @@
 """
-Streaming TTS service backed by Qwen3-TTS.
+Pipecat TTSService backed by Qwen3-TTS megakernel talker decoder.
 
-Accepts text, yields PCM audio chunks as they're decoded (not buffered).
-
-Usage (standalone test):
-    service = MegakernelTTSService()
-    for audio_chunk in service.synthesize("Hello world"):
-        play(audio_chunk)
+Accepts text frames from the pipeline, yields TTSAudioRawFrame chunks
+as codec tokens are decoded — no full-utterance buffering.
 """
 
-import time
-import logging
-from typing import Generator
+import asyncio
+from typing import AsyncGenerator
 
 import numpy as np
-import torch
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from pipecat.frames.frames import (
+    ErrorFrame,
+    Frame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.services.tts_service import TTSService
 
 SAMPLE_RATE = 24000
-# Chunk size in codec frames. At 12 Hz, 12 frames = 1 second of audio.
-# 6 frames = ~0.5 s — small enough for low latency, large enough to amortize decode overhead.
+# 6 codec frames ≈ 0.5 s of audio at 12 Hz — low latency without excessive decode calls
 CHUNK_FRAMES = 6
 
 
-class MegakernelTTSService:
+class QwenTTSService(TTSService):
     """
-    Streaming TTS service wrapping Qwen3-TTS-12Hz-0.6B-Base.
+    Pipecat TTS service backed by Qwen3-TTS-12Hz-0.6B-Base.
 
-    synthesize() yields raw PCM float32 numpy arrays at 24 kHz as soon as
-    each chunk of codec frames is decoded — no full-utterance buffering.
+    Drop-in replacement for any Pipecat TTSService.
+    Streams audio frame-by-frame as codec chunks are decoded.
     """
 
     def __init__(
@@ -37,70 +38,62 @@ class MegakernelTTSService:
         model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         language: str = "English",
         device: str = "cuda",
-        verbose: bool = True,
+        **kwargs,
     ):
-        from qwen_tts import Qwen3TTSModel
+        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=True, **kwargs)
 
-        self.language = language
-        self.sample_rate = SAMPLE_RATE
+        # Lazy-load on first use so pipeline construction doesn't block
+        self._model_name = model_name
+        self._language = language
+        self._device = device
+        self._tts = None
 
-        if verbose:
-            logger.info(f"Loading {model_name}...")
-
-        self.model = Qwen3TTSModel.from_pretrained(
-            model_name,
-            device_map=device,
-            dtype=torch.bfloat16,
-        )
-
-    def synthesize(self, text: str) -> Generator[np.ndarray, None, None]:
-        """
-        Yield PCM float32 chunks (numpy arrays, 24 kHz) as they are decoded.
-
-        Measures and logs TTFC (time to first chunk).
-        """
-        t0 = time.perf_counter()
-        first_chunk = True
-
-        # Generate all codec codes at once (talker + code predictor run inside here).
-        # We then stream the *decode* step chunk-by-chunk so audio starts playing
-        # before the full waveform is ready.
-        talker_codes, _ = self.model.model.generate(
-            input_ids=[self._encode(text)],
-            languages=[self.language],
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-            repetition_penalty=1.05,
-            subtalker_dosample=True,
-            subtalker_temperature=0.9,
-            subtalker_top_k=50,
-            subtalker_top_p=1.0,
-            max_new_tokens=4096,
-        )
-
-        codes = talker_codes[0]  # (T, num_code_groups)
-        total_frames = codes.shape[0]
-
-        for start in range(0, total_frames, CHUNK_FRAMES):
-            chunk_codes = codes[start : start + CHUNK_FRAMES]  # (C, G)
-
-            wavs, fs = self.model.model.speech_tokenizer.decode(
-                [{"audio_codes": chunk_codes}]
+    def _ensure_loaded(self):
+        if self._tts is None:
+            from pipeline.tts_service import MegakernelTTSService
+            self._tts = MegakernelTTSService(
+                model_name=self._model_name,
+                language=self._language,
+                device=self._device,
+                verbose=True,
             )
-            pcm = wavs[0].astype(np.float32)
 
-            if first_chunk:
-                ttfc_ms = (time.perf_counter() - t0) * 1000
-                logger.info(f"TTFC: {ttfc_ms:.1f} ms")
-                first_chunk = False
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        logger.debug(f"QwenTTSService synthesizing: {text!r}")
 
-            yield pcm
+        try:
+            await self.create_audio_context(context_id)
+            yield TTSStartedFrame(context_id=context_id)
+            await self.start_ttfb_metrics()
 
-    def _encode(self, text: str) -> torch.Tensor:
-        """Tokenize text into talker input_ids."""
-        formatted = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        inp = self.model.processor(text=formatted, return_tensors="pt", padding=True)
-        input_id = inp["input_ids"].to(next(self.model.model.parameters()).device)
-        return input_id if input_id.dim() == 2 else input_id.unsqueeze(0)
+            loop = asyncio.get_event_loop()
+
+            # Run the blocking model load + generate in a thread so we don't
+            # block the asyncio event loop
+            def _generate():
+                self._ensure_loaded()
+                return list(self._tts.synthesize(text))
+
+            chunks = await loop.run_in_executor(None, _generate)
+
+            first = True
+            for pcm in chunks:
+                if first:
+                    await self.stop_ttfb_metrics()
+                    first = False
+
+                # Convert float32 [-1, 1] → int16 PCM bytes
+                pcm_int16 = (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16)
+                yield TTSAudioRawFrame(
+                    audio=pcm_int16.tobytes(),
+                    sample_rate=SAMPLE_RATE,
+                    num_channels=1,
+                    context_id=context_id,
+                )
+
+        except Exception as e:
+            logger.error(f"QwenTTSService error: {e}")
+            yield ErrorFrame(str(e))
+        finally:
+            yield TTSStoppedFrame(context_id=context_id)
+            await self.remove_audio_context(context_id)

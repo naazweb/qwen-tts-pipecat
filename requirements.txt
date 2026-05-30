@@ -3,8 +3,12 @@ transformers>=4.57.3
 ninja
 accelerate
 qwen-tts>=0.1.1
-pipecat-ai
 faster-whisper
 numpy
-sounddevice
-pyaudio
+soundfile
+
+# Pipecat with WebRTC + runner + VAD
+pipecat-ai[webrtc,runner,silero]
+
+# WebRTC prebuilt UI (serves /client in browser)
+pipecat-ai-small-webrtc-prebuilt
