@@ -119,7 +119,7 @@ class OpenAILLM(FrameProcessor):
 # Bot entry point — called by the Pipecat runner per WebRTC connection
 # ---------------------------------------------------------------------------
 
-async def bot(request, runner_args: SmallWebRTCRunnerArguments):
+async def bot(runner_args: SmallWebRTCRunnerArguments):
     # Inject TURN servers into the existing connection
     runner_args.webrtc_connection.ice_servers = TURN_SERVERS
 
@@ -146,7 +146,7 @@ async def bot(request, runner_args: SmallWebRTCRunnerArguments):
         transport.output(),
     ])
 
-    task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
