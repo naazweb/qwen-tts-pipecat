@@ -101,6 +101,9 @@ class QwenTTSService(TTSService):
         self._language = language
         self._device = device
         self._tts: MegakernelTTSService | None = None
+        self._settings.model = model_name
+        self._settings.voice = None
+        self._settings.language = language
 
     def _ensure_loaded(self):
         if self._tts is None:

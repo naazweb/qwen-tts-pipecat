@@ -59,6 +59,8 @@ class WhisperSTTService(SegmentedSTTService):
         from faster_whisper import WhisperModel
         logger.info(f"Loading Whisper {model_size}...")
         self._whisper = WhisperModel(model_size, device=device, compute_type="float16")
+        self._settings.model = model_size
+        self._settings.language = None
 
     async def run_stt(self, audio: bytes):
         import io, wave
