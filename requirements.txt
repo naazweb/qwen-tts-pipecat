@@ -1,0 +1,9 @@
+torch>=2.0.0
+transformers>=4.57.3
+ninja
+accelerate
+pipecat-ai
+faster-whisper
+numpy
+sounddevice
+pyaudio
