@@ -109,7 +109,7 @@ class QwenTTSService(TTSService):
         device: str = "cuda",
         **kwargs,
     ):
-        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=True, **kwargs)
+        super().__init__(sample_rate=SAMPLE_RATE, **kwargs)
         self._model_name = model_name
         self._language = language
         self._device = device
@@ -128,16 +128,24 @@ class QwenTTSService(TTSService):
         self._ensure_loaded()
         try:
             yield TTSStartedFrame()
-            await self.start_ttfb_metrics()
 
-            chunks = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: list(self._tts.synthesize(text))
-            )
+            loop = asyncio.get_event_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+
+            def _generate():
+                for pcm in self._tts.synthesize(text):
+                    queue.put_nowait(pcm)
+                queue.put_nowait(None)  # sentinel
+
+            loop.run_in_executor(None, _generate)
 
             first = True
-            for pcm in chunks:
+            while True:
+                pcm = await queue.get()
+                if pcm is None:
+                    break
                 if first:
-                    await self.stop_ttfb_metrics()
+                    logger.info("First audio chunk ready")
                     first = False
                 pcm_int16 = (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16)
                 yield TTSAudioRawFrame(
