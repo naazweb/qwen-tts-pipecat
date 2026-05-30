@@ -2,6 +2,7 @@ torch>=2.0.0
 transformers>=4.57.3
 ninja
 accelerate
+qwen-tts>=0.1.1
 pipecat-ai
 faster-whisper
 numpy
