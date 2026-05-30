@@ -29,14 +29,24 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.run import main as runner_main
-from pipecat.runner.types import RunnerArguments
+from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.transports.smallwebrtc.connection import IceServer
 from pipecat.workers.runner import WorkerRunner
 
 from openai import AsyncOpenAI
 from tts_service import QwenTTSService
+
+TURN_SERVERS = [
+    IceServer(
+        urls=["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+        username="openrelayproject",
+        credential="openrelayproject",
+    ),
+    IceServer(urls=["stun:stun.l.google.com:19302"]),
+]
 
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -157,6 +167,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
 async def bot(runner_args: RunnerArguments):
+    if isinstance(runner_args, SmallWebRTCRunnerArguments):
+        runner_args.webrtc_connection.ice_servers = TURN_SERVERS
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)
 
