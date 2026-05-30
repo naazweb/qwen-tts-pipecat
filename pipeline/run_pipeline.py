@@ -30,12 +30,14 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.runner.run import main as runner_main
+from pipecat.runner.run import main as runner_main, app as pipecat_app
 from pipecat.runner.types import SmallWebRTCRunnerArguments
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection, IceServer
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
 # Free TURN server — forces relay over TCP when UDP is blocked (e.g. Vast.ai)
 TURN_SERVERS = [
@@ -49,6 +51,40 @@ TURN_SERVERS = [
 
 from openai import AsyncOpenAI
 from tts_service import QwenTTSService
+
+
+# Inject TURN servers into every /start response so the browser uses relay candidates
+@pipecat_app.middleware("http")
+async def inject_ice_config(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/start" and request.method == "POST":
+        import json
+        from starlette.responses import Response
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+        try:
+            data = json.loads(body)
+            data["iceConfig"] = {
+                "iceServers": [
+                    {
+                        "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+                        "username": "openrelayproject",
+                        "credential": "openrelayproject",
+                    },
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                ]
+            }
+            return Response(
+                content=json.dumps(data),
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                media_type="application/json",
+            )
+        except Exception:
+            return Response(content=body, status_code=response.status_code,
+                          headers=dict(response.headers))
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -122,16 +158,13 @@ class OpenAILLM(FrameProcessor):
 # ---------------------------------------------------------------------------
 
 async def bot(runner_args: SmallWebRTCRunnerArguments):
-    # Inject TURN servers into the existing connection
-    runner_args.webrtc_connection.ice_servers = TURN_SERVERS
-
     transport = SmallWebRTCTransport(
         webrtc_connection=runner_args.webrtc_connection,
         params=TransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.3, start_secs=0.1, confidence=0.4)),
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8, start_secs=0.2, confidence=0.7)),
             audio_out_sample_rate=24000,
         ),
     )
