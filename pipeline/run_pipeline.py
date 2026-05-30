@@ -31,8 +31,18 @@ from pipecat.runner.run import main as runner_main
 from pipecat.runner.types import SmallWebRTCRunnerArguments
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection, IceServer
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
+
+# Free TURN server — forces relay over TCP when UDP is blocked (e.g. Vast.ai)
+TURN_SERVERS = [
+    IceServer(
+        urls=["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+        username="openrelayproject",
+        credential="openrelayproject",
+    ),
+    IceServer(urls=["stun:stun.l.google.com:19302"]),
+]
 
 from tts_service import QwenTTSService
 
@@ -87,6 +97,9 @@ class EchoLLM(FrameProcessor):
 # ---------------------------------------------------------------------------
 
 async def bot(runner_args: SmallWebRTCRunnerArguments):
+    # Inject TURN servers into the existing connection
+    runner_args.webrtc_connection.ice_servers = TURN_SERVERS
+
     transport = SmallWebRTCTransport(
         webrtc_connection=runner_args.webrtc_connection,
         params=TransportParams(
