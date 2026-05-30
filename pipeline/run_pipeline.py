@@ -31,7 +31,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.run import main as runner_main
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.stt_service import SegmentedSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
@@ -51,38 +51,13 @@ transport_params = {
 
 
 # ---------------------------------------------------------------------------
-# Faster-Whisper STT
+# Bot
 # ---------------------------------------------------------------------------
 
-class WhisperSTTService(SegmentedSTTService):
-    def __init__(self, model_size: str = "base.en", device: str = "cuda", **kwargs):
-        super().__init__(**kwargs)
-        from faster_whisper import WhisperModel
-        logger.info(f"Loading Whisper {model_size}...")
-        self._whisper = WhisperModel(model_size, device=device, compute_type="float16")
-        self._settings.model = model_size
-        self._settings.language = None
-
-    async def run_stt(self, audio: bytes):
-        import io, wave
-        import numpy as np
-
-        with io.BytesIO(audio) as f:
-            with wave.open(f) as wf:
-                raw = wf.readframes(wf.getnframes())
-                pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-        logger.info(f"STT received audio: {len(pcm)/16000:.2f}s, rms={float(np.sqrt(np.mean(pcm**2))):.4f}")
-
-        loop = asyncio.get_event_loop()
-        segments, _ = await loop.run_in_executor(
-            None, lambda: self._whisper.transcribe(pcm, beam_size=1, language="en")
-        )
-        text = " ".join(s.text.strip() for s in segments).strip()
-        logger.info(f"Whisper output: {text!r}")
-        if text:
-            yield TranscriptionFrame(text=text, user_id="user", timestamp=0)
-
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    llm = OpenAILLM()
+    tts = QwenTTSService(language="English", device="cuda")
 
 # ---------------------------------------------------------------------------
 # OpenAI LLM
@@ -98,6 +73,7 @@ class OpenAILLM(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
+            logger.info(f"Transcription received: {frame.text!r}")
             self._history.append({"role": "user", "content": frame.text})
             await self.push_frame(LLMFullResponseStartFrame())
             full = ""
