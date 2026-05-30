@@ -114,6 +114,10 @@ class QwenTTSService(TTSService):
         self._language = language
         self._device = device
         self._tts: MegakernelTTSService | None = None
+        # Satisfy Pipecat 1.3.0 settings validation
+        self.set_model(None)
+        self.set_voice(None)
+        self.set_language(language)
 
     def _ensure_loaded(self):
         if self._tts is None:
