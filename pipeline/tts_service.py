@@ -1,15 +1,17 @@
 """
-Pipecat TTSService backed by Qwen3-TTS.
+Pipecat TTSService backed by Qwen3-TTS + megakernel talker decoder.
 
-Also exposes MegakernelTTSService for standalone use:
-    svc = MegakernelTTSService()
-    for pcm_chunk in svc.synthesize("Hello world"):
-        play(pcm_chunk)
+Pipeline per utterance:
+  1. HF model prefill  — encode text, run talker prefill, get first codec token
+  2. Megakernel decode — TalkerDecoder.step() loop for remaining codec tokens
+  3. Codec → PCM       — speech_tokenizer.decode() every CHUNK_FRAMES tokens
+  4. Stream chunks     — yield TTSAudioRawFrame as each chunk is ready
 """
 
 import asyncio
+import sys
+import os
 import time
-import logging
 from typing import AsyncGenerator, Generator
 
 import numpy as np
@@ -24,87 +26,117 @@ from pipecat.frames.frames import (
 )
 from pipecat.services.tts_service import TTSService
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 SAMPLE_RATE = 24000
-CHUNK_FRAMES = 6  # 6 codec frames ≈ 0.5 s at 12 Hz
+CHUNK_FRAMES = 6   # codec frames per PCM chunk (~0.5 s at 12 Hz)
+EOS_TOKEN = 4096   # Qwen3-TTS codec EOS id
 
 
 class MegakernelTTSService:
     """
-    Standalone TTS service wrapping Qwen3-TTS-12Hz-0.6B-Base.
-    Yields float32 PCM numpy arrays at 24 kHz, chunk by chunk.
+    Synthesizes speech using:
+      - HuggingFace Qwen3-TTS for text encoding + talker prefill
+      - TalkerDecoder (megakernel) for autoregressive codec token decode
+      - HF speech_tokenizer for codec tokens → PCM
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        model_name: str = "Qwen/Qwen3-TTS",
         language: str = "English",
         device: str = "cuda",
         verbose: bool = True,
     ):
         import torch
-        from qwen_tts import Qwen3TTSModel
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        from tts_engine import TalkerDecoder
 
         self.language = language
         self.sample_rate = SAMPLE_RATE
+        self._device = device
 
         if verbose:
-            logger.info(f"Loading {model_name}...")
+            logger.info(f"Loading {model_name} (HF model for prefill + codec)...")
 
-        self.model = Qwen3TTSModel.from_pretrained(
+        self._hf_model = AutoModelForCausalLM.from_pretrained(
             model_name,
+            torch_dtype=torch.bfloat16,
             device_map=device,
-            dtype=torch.bfloat16,
+            trust_remote_code=True,
         )
+        self._processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        self._speech_tokenizer = self._hf_model.speech_tokenizer
+
+        if verbose:
+            logger.info("Loading TalkerDecoder (megakernel)...")
+        self._talker = TalkerDecoder(model_name=model_name, verbose=verbose)
 
     def synthesize(self, text: str) -> Generator[np.ndarray, None, None]:
-        """Yield float32 PCM chunks as codec frames are decoded."""
+        """
+        Yield float32 PCM chunks as codec frames are decoded via megakernel.
+        Streams chunk-by-chunk rather than buffering the full utterance.
+        """
+        import torch
+
         t0 = time.perf_counter()
-        first = True
 
-        talker_codes, _ = self.model.model.generate(
-            input_ids=[self._encode(text)],
-            languages=[self.language],
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-            repetition_penalty=1.05,
-            subtalker_dosample=True,
-            subtalker_temperature=0.9,
-            subtalker_top_k=50,
-            subtalker_top_p=1.0,
-            max_new_tokens=4096,
-        )
+        # --- Step 1: prefill — get the first codec token from HF model ---
+        formatted = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        inputs = self._processor(text=formatted, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"].to(self._device)
 
-        codes = talker_codes[0]
-        for start in range(0, codes.shape[0], CHUNK_FRAMES):
-            chunk = codes[start : start + CHUNK_FRAMES]
-            wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
-            pcm = wavs[0].astype(np.float32)
+        with torch.no_grad():
+            # Run prefill through HF model to populate its KV cache,
+            # get logits for first codec token
+            outputs = self._hf_model(input_ids=input_ids, use_cache=True)
+            first_token_id = int(outputs.logits[0, -1].argmax().item())
 
-            if first:
-                logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
-                first = False
+        logger.info(f"Prefill done in {(time.perf_counter()-t0)*1000:.1f} ms, first token={first_token_id}")
 
+        # --- Step 2: megakernel decode loop ---
+        self._talker.reset()
+        codec_tokens = [first_token_id]
+        token_id = first_token_id
+        first_chunk = True
+
+        while token_id != EOS_TOKEN and len(codec_tokens) < 4096:
+            token_id = self._talker.step(token_id)
+            codec_tokens.append(token_id)
+
+            # Every CHUNK_FRAMES tokens, decode to PCM and yield
+            if len(codec_tokens) % CHUNK_FRAMES == 0:
+                chunk_codes = codec_tokens[-CHUNK_FRAMES:]
+                pcm = self._decode_chunk(chunk_codes)
+                if first_chunk:
+                    logger.info(f"TTFC: {(time.perf_counter()-t0)*1000:.1f} ms")
+                    first_chunk = False
+                yield pcm
+
+        # Yield any remaining tokens
+        remainder = len(codec_tokens) % CHUNK_FRAMES
+        if remainder > 0:
+            pcm = self._decode_chunk(codec_tokens[-remainder:])
             yield pcm
 
-    def _encode(self, text: str):
+    def _decode_chunk(self, token_ids: list) -> np.ndarray:
+        """Decode a list of codec token ids to float32 PCM via speech_tokenizer."""
         import torch
-        formatted = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
-        inp = self.model.processor(text=formatted, return_tensors="pt", padding=True)
-        input_id = inp["input_ids"].to(next(self.model.model.parameters()).device)
-        return input_id if input_id.dim() == 2 else input_id.unsqueeze(0)
+        codes = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).unsqueeze(0)  # [1, 1, T]
+        with torch.no_grad():
+            wavs = self._speech_tokenizer.decode(codes)
+        return wavs[0, 0].cpu().float().numpy()
 
 
 class QwenTTSService(TTSService):
     """
-    Pipecat TTSService backed by Qwen3-TTS.
+    Pipecat TTSService backed by Qwen3-TTS + megakernel.
     Streams TTSAudioRawFrame chunks as codec frames are decoded.
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        model_name: str = "Qwen/Qwen3-TTS",
         language: str = "English",
         device: str = "cuda",
         **kwargs,
@@ -114,10 +146,6 @@ class QwenTTSService(TTSService):
         self._language = language
         self._device = device
         self._tts: MegakernelTTSService | None = None
-        # Satisfy Pipecat 1.3.0 settings validation
-        self.set_model(None)
-        self.set_voice(None)
-        self.set_language(language)
 
     def _ensure_loaded(self):
         if self._tts is None:
@@ -149,7 +177,7 @@ class QwenTTSService(TTSService):
                     context_id=context_id,
                 )
         except Exception as e:
-            logger.error(f"QwenTTSService error: {e}")
+            logger.error(f"QwenTTSService error: {e}", exc_info=True)
             yield ErrorFrame(str(e))
         finally:
             yield TTSStoppedFrame(context_id=context_id)

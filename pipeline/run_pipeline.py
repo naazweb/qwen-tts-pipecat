@@ -59,9 +59,6 @@ class WhisperSTTService(SegmentedSTTService):
         from faster_whisper import WhisperModel
         logger.info(f"Loading Whisper {model_size}...")
         self._whisper = WhisperModel(model_size, device=device, compute_type="float16")
-        # Satisfy Pipecat 1.3.0 settings validation
-        self.set_model(model_size)
-        self.set_language("en")
 
     async def run_stt(self, audio: bytes):
         import io, wave
@@ -139,7 +136,7 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
 
     stt = WhisperSTTService(model_size="base.en", device="cuda")
     llm = OpenAILLM()
-    tts = QwenTTSService(language="English", device="cuda")
+    tts = QwenTTSService(language="English", device="cuda", model_name="Qwen/Qwen3-TTS")
 
     pipeline = Pipeline([
         transport.input(),
