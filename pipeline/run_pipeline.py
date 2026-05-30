@@ -151,6 +151,9 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
         from pipecat.frames.frames import TTSSpeakFrame
+        logger.info("Client connected — sending greeting")
+        await asyncio.sleep(2)
+        logger.info("Queuing greeting TTS frame")
         await task.queue_frame(TTSSpeakFrame("Hello! I am your voice assistant powered by Qwen3 TTS. How can I help you today?"))
 
     @transport.event_handler("on_client_disconnected")
