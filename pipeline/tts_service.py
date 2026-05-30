@@ -123,11 +123,11 @@ class QwenTTSService(TTSService):
                 device=self._device,
             )
 
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         logger.debug(f"QwenTTSService synthesizing: {text!r}")
         self._ensure_loaded()
         try:
-            yield TTSStartedFrame()
+            yield TTSStartedFrame(context_id=context_id)
 
             loop = asyncio.get_event_loop()
             queue: asyncio.Queue = asyncio.Queue()
@@ -135,7 +135,7 @@ class QwenTTSService(TTSService):
             def _generate():
                 for pcm in self._tts.synthesize(text):
                     queue.put_nowait(pcm)
-                queue.put_nowait(None)  # sentinel
+                queue.put_nowait(None)
 
             loop.run_in_executor(None, _generate)
 
@@ -152,9 +152,10 @@ class QwenTTSService(TTSService):
                     audio=pcm_int16.tobytes(),
                     sample_rate=SAMPLE_RATE,
                     num_channels=1,
+                    context_id=context_id,
                 )
         except Exception as e:
             logger.error(f"QwenTTSService error: {e}")
             yield ErrorFrame(str(e))
         finally:
-            yield TTSStoppedFrame()
+            yield TTSStoppedFrame(context_id=context_id)
