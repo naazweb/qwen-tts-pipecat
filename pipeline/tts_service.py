@@ -129,24 +129,14 @@ class QwenTTSService(TTSService):
         try:
             yield TTSStartedFrame(context_id=context_id)
 
-            loop = asyncio.get_event_loop()
-            queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            chunks = await loop.run_in_executor(
+                None, lambda: list(self._tts.synthesize(text))
+            )
 
-            def _generate():
-                for pcm in self._tts.synthesize(text):
-                    queue.put_nowait(pcm)
-                queue.put_nowait(None)
-
-            loop.run_in_executor(None, _generate)
-
-            first = True
-            while True:
-                pcm = await queue.get()
-                if pcm is None:
-                    break
-                if first:
+            for i, pcm in enumerate(chunks):
+                if i == 0:
                     logger.info("First audio chunk ready")
-                    first = False
                 pcm_int16 = (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16)
                 yield TTSAudioRawFrame(
                     audio=pcm_int16.tobytes(),
