@@ -7,7 +7,7 @@ faster-whisper
 numpy
 soundfile
 
-# Pipecat with WebRTC + runner + VAD
+openai>=1.0.0
 pipecat-ai[webrtc,runner,silero]
 
 # WebRTC prebuilt UI (serves /client in browser)

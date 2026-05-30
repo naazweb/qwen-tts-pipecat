@@ -45,6 +45,7 @@ TURN_SERVERS = [
     IceServer(urls=["stun:stun.l.google.com:19302"]),
 ]
 
+from openai import AsyncOpenAI
 from tts_service import QwenTTSService
 
 
@@ -82,15 +83,33 @@ class WhisperSTTService(SegmentedSTTService):
 
 
 # ---------------------------------------------------------------------------
-# Echo LLM — passes transcription straight to TTS (demo, replace with real LLM)
+# OpenAI LLM — streams response tokens directly to TTS
 # ---------------------------------------------------------------------------
 
-class EchoLLM(FrameProcessor):
+class OpenAILLM(FrameProcessor):
+    def __init__(self, model: str = "gpt-4o-mini", system: str = "You are a helpful voice assistant. Keep responses concise and conversational."):
+        super().__init__()
+        self._client = AsyncOpenAI()
+        self._model = model
+        self._system = system
+        self._history = [{"role": "system", "content": system}]
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
         if isinstance(frame, TranscriptionFrame):
+            self._history.append({"role": "user", "content": frame.text})
             await self.push_frame(LLMFullResponseStartFrame())
-            await self.push_frame(TextFrame(text=frame.text))
+            full = ""
+            async with self._client.chat.completions.stream(
+                model=self._model,
+                messages=self._history,
+            ) as stream:
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content if chunk.choices else None
+                    if token:
+                        full += token
+                        await self.push_frame(TextFrame(text=token))
+            self._history.append({"role": "assistant", "content": full})
             await self.push_frame(LLMFullResponseEndFrame())
         else:
             await self.push_frame(frame, direction)
@@ -116,7 +135,7 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
     )
 
     stt = WhisperSTTService(model_size="base.en", device="cuda")
-    llm = EchoLLM()
+    llm = OpenAILLM()
     tts = QwenTTSService(language="English", device="cuda")
 
     pipeline = Pipeline([
