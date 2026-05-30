@@ -26,19 +26,27 @@ from pipecat.frames.frames import (
     TextFrame, TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.run import main as runner_main
-from pipecat.runner.types import SmallWebRTCRunnerArguments
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 from pipecat.services.stt_service import SegmentedSTTService
-from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection, IceServer
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.transports.base_transport import BaseTransport, TransportParams
+from pipecat.workers.runner import WorkerRunner
 
 from openai import AsyncOpenAI
 from tts_service import QwenTTSService
+
+transport_params = {
+    "webrtc": lambda: TransportParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        vad_enabled=True,
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8, start_secs=0.2, confidence=0.7)),
+        audio_out_sample_rate=24000,
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -106,24 +114,12 @@ class OpenAILLM(FrameProcessor):
 
 
 # ---------------------------------------------------------------------------
-# Bot entry point
+# Bot
 # ---------------------------------------------------------------------------
 
-async def bot(runner_args: SmallWebRTCRunnerArguments):
-    transport = SmallWebRTCTransport(
-        webrtc_connection=runner_args.webrtc_connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8, start_secs=0.2, confidence=0.7)),
-            audio_out_sample_rate=24000,
-        ),
-    )
-
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     stt = WhisperSTTService(model_size="base.en", device="cuda")
     llm = OpenAILLM()
-    context = LLMContext()
     tts = QwenTTSService(language="English", device="cuda")
 
     pipeline = Pipeline([
@@ -134,22 +130,33 @@ async def bot(runner_args: SmallWebRTCRunnerArguments):
         transport.output(),
     ])
 
-    task = PipelineWorker(pipeline, params=PipelineParams(allow_interruptions=True))
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            allow_interruptions=True,
+            enable_metrics=True,
+        ),
+    )
 
     @transport.event_handler("on_client_connected")
     async def on_connected(transport, client):
-        from pipecat.frames.frames import LLMRunFrame
+        from pipecat.frames.frames import TTSSpeakFrame
         logger.info("Client connected — sending greeting")
-        await asyncio.sleep(5)
-        context.add_message({"role": "user", "content": "Please introduce yourself to the user."})
-        await task.queue_frames(LLMRunFrame())
+        await asyncio.sleep(2)
+        await worker.queue_frames([TTSSpeakFrame("Hello! I am your voice assistant powered by Qwen3 TTS. How can I help you today?")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_disconnect(transport, client):
-        await task.queue_frame(EndFrame())
+        await worker.cancel()
 
-    runner = PipelineRunner(handle_sigint=False)
-    await runner.run(task)
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+    await runner.add_workers(worker)
+    await runner.run()
+
+
+async def bot(runner_args: RunnerArguments):
+    transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
 
 
 # ---------------------------------------------------------------------------
