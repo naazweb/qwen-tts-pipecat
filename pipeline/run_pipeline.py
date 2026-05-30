@@ -68,11 +68,14 @@ class WhisperSTTService(SegmentedSTTService):
                 raw = wf.readframes(wf.getnframes())
                 pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
+        logger.info(f"STT received audio: {len(pcm)/16000:.2f}s, rms={float(np.sqrt(np.mean(pcm**2))):.4f}")
+
         loop = asyncio.get_event_loop()
         segments, _ = await loop.run_in_executor(
             None, lambda: self._whisper.transcribe(pcm, beam_size=1, language="en")
         )
         text = " ".join(s.text.strip() for s in segments).strip()
+        logger.info(f"Whisper output: {text!r}")
         if text:
             logger.info(f"Transcribed: {text!r}")
             yield TranscriptionFrame(text=text, user_id="user", timestamp=0)
