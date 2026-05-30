@@ -113,6 +113,7 @@ class QwenTTSService(TTSService):
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         logger.debug(f"QwenTTSService synthesizing: {text!r}")
         self._ensure_loaded()
+        await self.create_audio_context(context_id)
         try:
             yield TTSStartedFrame(context_id=context_id)
 
@@ -136,3 +137,4 @@ class QwenTTSService(TTSService):
             yield ErrorFrame(str(e))
         finally:
             yield TTSStoppedFrame(context_id=context_id)
+            await self.remove_audio_context(context_id)
