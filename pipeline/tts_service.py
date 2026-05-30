@@ -14,6 +14,8 @@ import os
 import time
 from typing import AsyncGenerator, Generator
 
+os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
+
 import numpy as np
 from loguru import logger
 
@@ -43,7 +45,7 @@ class MegakernelTTSService:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS",
+        model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         language: str = "English",
         device: str = "cuda",
         verbose: bool = True,
@@ -136,7 +138,7 @@ class QwenTTSService(TTSService):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-TTS",
+        model_name: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         language: str = "English",
         device: str = "cuda",
         **kwargs,
