@@ -1,12 +1,10 @@
 """
 End-to-end voice agent pipeline.
 
-    Browser mic → VAD → Whisper STT → OpenAI LLM → QwenTTSService → Browser speaker
+    Browser mic → Deepgram STT → OpenAI LLM → QwenTTSService → Browser speaker
 
 Run:
-    python pipeline/run_pipeline.py
-
-Then open http://<server-ip>:7860/client in your browser.
+    python pipeline/run_pipeline.py -t daily
 """
 
 import asyncio
@@ -51,15 +49,6 @@ transport_params = {
 
 
 # ---------------------------------------------------------------------------
-# Bot
-# ---------------------------------------------------------------------------
-
-async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    llm = OpenAILLM()
-    tts = QwenTTSService(language="English", device="cuda")
-
-# ---------------------------------------------------------------------------
 # OpenAI LLM
 # ---------------------------------------------------------------------------
 
@@ -97,7 +86,7 @@ class OpenAILLM(FrameProcessor):
 # ---------------------------------------------------------------------------
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    stt = WhisperSTTService(model_size="base.en", device="cuda")
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
     llm = OpenAILLM()
     tts = QwenTTSService(language="English", device="cuda")
 
