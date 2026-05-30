@@ -28,13 +28,15 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.runner.run import main as runner_main
+from pipecat.runner.run import main as runner_main, app as pipecat_app
 from pipecat.runner.types import RunnerArguments, SmallWebRTCRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.smallwebrtc.connection import IceServer
+from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.request_handler import SmallWebRTCRequestHandler, SmallWebRTCRequest, SmallWebRTCPatchRequest
 from pipecat.workers.runner import WorkerRunner
+from fastapi import BackgroundTasks
 
 from openai import AsyncOpenAI
 from tts_service import QwenTTSService
@@ -47,6 +49,33 @@ TURN_SERVERS = [
     ),
     IceServer(urls=["stun:stun.l.google.com:19302"]),
 ]
+
+# Create our own handler with TURN servers pre-configured
+_webrtc_handler = SmallWebRTCRequestHandler(ice_servers=TURN_SERVERS)
+
+
+@pipecat_app.post("/api/offer")
+async def offer(request: SmallWebRTCRequest, background_tasks: BackgroundTasks):
+    import uuid
+    async def connection_callback(connection: SmallWebRTCConnection):
+        from pipecat.runner.run import _get_bot_module
+        bot_module = _get_bot_module()
+        runner_args = SmallWebRTCRunnerArguments(
+            webrtc_connection=connection,
+            session_id=str(uuid.uuid4()),
+        )
+        background_tasks.add_task(bot_module.bot, runner_args)
+
+    return await _webrtc_handler.handle_web_request(
+        request=request,
+        webrtc_connection_callback=connection_callback,
+    )
+
+
+@pipecat_app.patch("/api/offer")
+async def ice_candidate(request: SmallWebRTCPatchRequest):
+    await _webrtc_handler.handle_patch_request(request)
+    return {"status": "success"}
 
 transport_params = {
     "webrtc": lambda: TransportParams(
@@ -167,8 +196,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
 
 async def bot(runner_args: RunnerArguments):
-    if isinstance(runner_args, SmallWebRTCRunnerArguments):
-        runner_args.webrtc_connection.ice_servers = TURN_SERVERS
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)
 
