@@ -135,7 +135,7 @@ class QwenTTSService(TTSService):
         device: str = "cuda",
         **kwargs,
     ):
-        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=True, stop_frame_timeout_s=30.0, **kwargs)
+        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=False, **kwargs)
         self._model_name = model_name
         self._language = language
         self._device = device
@@ -156,6 +156,10 @@ class QwenTTSService(TTSService):
         logger.debug(f"QwenTTSService synthesizing: {text!r}")
         self._ensure_loaded()
         try:
+            await self.create_audio_context(context_id)
+            await self.start_ttfb_metrics()
+            yield TTSStartedFrame(context_id=context_id)
+
             loop = asyncio.get_running_loop()
             queue: asyncio.Queue = asyncio.Queue()
 
@@ -184,6 +188,9 @@ class QwenTTSService(TTSService):
                     num_channels=1,
                     context_id=context_id,
                 )
+
+            yield TTSStoppedFrame(context_id=context_id)
+            await self.remove_audio_context(context_id)
         except Exception as e:
             logger.error(f"QwenTTSService error: {e}", exc_info=True)
             yield ErrorFrame(str(e))
