@@ -3,12 +3,11 @@ transformers>=4.57.3
 ninja
 accelerate
 qwen-tts>=0.1.1
-faster-whisper
 numpy
 soundfile
 
 openai>=1.0.0
-pipecat-ai[webrtc,runner,silero]
+pipecat-ai[daily,deepgram,google,runner,silero]
 
 # WebRTC prebuilt UI (serves /client in browser)
 pipecat-ai-small-webrtc-prebuilt

@@ -20,12 +20,10 @@ from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    EndFrame, Frame, LLMFullResponseEndFrame, LLMFullResponseStartFrame,
-    TextFrame, TranscriptionFrame,
+    EndFrame, Frame, TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.run import main as runner_main
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -34,7 +32,7 @@ from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 
-from openai import AsyncOpenAI
+from pipecat.services.google.vertex.llm import GoogleLLMService
 from tts_service import QwenTTSService
 
 transport_params = {
@@ -49,45 +47,18 @@ transport_params = {
 
 
 # ---------------------------------------------------------------------------
-# OpenAI LLM
-# ---------------------------------------------------------------------------
-
-class OpenAILLM(FrameProcessor):
-    def __init__(self, model: str = "gpt-4o-mini", system: str = "You are a helpful voice assistant. Keep responses concise and conversational."):
-        super().__init__()
-        self._client = AsyncOpenAI()
-        self._model = model
-        self._history = [{"role": "system", "content": system}]
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
-            logger.info(f"Transcription received: {frame.text!r}")
-            self._history.append({"role": "user", "content": frame.text})
-            await self.push_frame(LLMFullResponseStartFrame())
-            full = ""
-            async with self._client.chat.completions.stream(
-                model=self._model,
-                messages=self._history,
-            ) as stream:
-                async for chunk in stream:
-                    token = chunk.choices[0].delta.content if chunk.choices else None
-                    if token:
-                        full += token
-                        await self.push_frame(TextFrame(text=token))
-            self._history.append({"role": "assistant", "content": full})
-            await self.push_frame(LLMFullResponseEndFrame())
-        else:
-            await self.push_frame(frame, direction)
-
-
-# ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-    llm = OpenAILLM()
+    llm = GoogleLLMService(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        settings=GoogleLLMService.Settings(
+            model="gemini-2.0-flash",
+            system_instruction="You are a helpful voice assistant. Keep responses concise and conversational.",
+        ),
+    )
     tts = QwenTTSService(language="English", device="cuda")
 
     pipeline = Pipeline([
