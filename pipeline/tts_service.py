@@ -86,13 +86,16 @@ class MegakernelTTSService:
                 max_new_tokens=4096,
             )
 
+        logger.debug(f"synthesize: starting generation thread for {text!r}")
         t = threading.Thread(target=_run_generate, daemon=True)
         t.start()
 
         buf = []
+        chunk_count = 0
         while True:
             tok = token_queue.get()
             if tok is None:
+                logger.debug(f"synthesize: generation complete, {chunk_count} chunks yielded")
                 break
             buf.append(tok)
             if len(buf) >= CHUNK_FRAMES:
@@ -103,14 +106,18 @@ class MegakernelTTSService:
                     logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
                     first = False
                 buf = []
+                chunk_count += 1
+                logger.debug(f"synthesize: yielding chunk #{chunk_count} ({len(pcm)} samples)")
                 yield pcm
 
         if buf:
+            logger.debug(f"synthesize: flushing {len(buf)} remaining tokens")
             chunk = torch.tensor(buf, dtype=torch.long).unsqueeze(0)
             wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
             yield wavs[0].astype(np.float32)
 
         t.join()
+        logger.debug(f"synthesize: generation thread joined")
 
     def _encode(self, text: str):
         import torch
@@ -154,19 +161,22 @@ class QwenTTSService(TTSService):
 
             def _generate():
                 for pcm in self._tts.synthesize(text):
-                    queue.put_nowait(pcm)
-                queue.put_nowait(None)
+                    loop.call_soon_threadsafe(queue.put_nowait, pcm)
+                loop.call_soon_threadsafe(queue.put_nowait, None)
 
             loop.run_in_executor(None, _generate)
 
             first = True
+            frame_count = 0
             while True:
                 pcm = await queue.get()
                 if pcm is None:
+                    logger.info(f"run_tts: done, pushed {frame_count} audio frames")
                     break
                 if first:
-                    logger.info("First audio chunk ready")
+                    logger.info("run_tts: first audio frame ready, streaming started")
                     first = False
+                frame_count += 1
                 pcm_int16 = (np.clip(pcm, -1.0, 1.0) * 32767).astype(np.int16)
                 yield TTSAudioRawFrame(
                     audio=pcm_int16.tobytes(),
