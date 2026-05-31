@@ -53,13 +53,12 @@ class MegakernelTTSService:
 
     def synthesize(self, text: str) -> Generator[np.ndarray, None, None]:
         import torch
-        from transformers import BaseStreamer
 
         t0 = time.perf_counter()
         first = True
         token_queue: _queue.Queue = _queue.Queue()
 
-        class _CodeStreamer(BaseStreamer):
+        class _CodeStreamer:
             def put(self, value):
                 toks = value.squeeze(0) if value.dim() > 1 else value
                 for tok in toks.tolist():
