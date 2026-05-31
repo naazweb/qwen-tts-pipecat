@@ -1,11 +1,7 @@
-"""
-Build the CUDA extension for the TTS megakernel.
+"""JIT compilation of the megakernel for Qwen3-TTS talker decoder.
 
-Key difference from the original qwen_megakernel build:
-  -DLDG_VOCAB_SIZE=3072  (talker codec vocab, not 151936)
-
-Usage:
-    python build.py
+Identical to qwen_megakernel/build.py but compiled with -DLDG_VOCAB_SIZE=3072
+to match the talker's codec vocabulary instead of the text vocabulary (151936).
 """
 
 import os
@@ -22,7 +18,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 KERNEL_FLAGS = [
-    "-DLDG_VOCAB_SIZE=3072",  # talker codec vocab (overrides default 151936)
     f"-DLDG_NUM_BLOCKS={_env_int('LDG_NUM_BLOCKS', 128)}",
     f"-DLDG_BLOCK_SIZE={_env_int('LDG_BLOCK_SIZE', 512)}",
     f"-DLDG_LM_NUM_BLOCKS={_env_int('LDG_LM_NUM_BLOCKS', 1280)}",
@@ -40,6 +35,8 @@ KERNEL_FLAGS = [
     "-DLDG_ATTENTION_VEC4",
     "-DLDG_WEIGHT_LDCS",
     "-DLDG_MLP_SMEM",
+    # Override vocab size for talker codec vocabulary
+    "-DLDG_VOCAB_SIZE=3072",
 ]
 
 CUDA_FLAGS = [
@@ -53,19 +50,19 @@ CUDA_FLAGS = [
 
 
 def get_extension():
-    """Build (or return cached) the TTS megakernel extension."""
+    """Build (or return cached) the talker megakernel extension."""
     global _module
     if _module is not None:
         return _module
 
     _module = load(
-        name="qwen_tts_C",
+        name="qwen_tts_talker_C",
         sources=[
             os.path.join(_CSRC, "torch_bindings.cpp"),
             os.path.join(_CSRC, "kernel.cu"),
         ],
         extra_cuda_cflags=CUDA_FLAGS,
         extra_cflags=[f"-I{_CSRC}"],
-        verbose=False,
+        verbose=True,
     )
     return _module

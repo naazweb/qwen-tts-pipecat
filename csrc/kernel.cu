@@ -72,8 +72,10 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
 
-// LM head
-constexpr int LDG_VOCAB_SIZE = 151936;
+// LM head — overridden to 3072 for talker codec vocab via -DLDG_VOCAB_SIZE=3072
+#ifndef LDG_VOCAB_SIZE
+#define LDG_VOCAB_SIZE 151936
+#endif
 
 struct LDGLayerWeights {
   const __nv_bfloat16 *input_layernorm_weight;

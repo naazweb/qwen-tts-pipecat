@@ -1,17 +1,12 @@
-"""Benchmark: Qwen3-TTS pipeline vs PyTorch HuggingFace baseline."""
+"""Benchmark: Qwen3-TTS pipeline text token decode vs PyTorch HuggingFace baseline."""
 
 import gc
-import queue
-import sys
-import threading
 import time
 import warnings
 
 import torch
 
 warnings.filterwarnings("ignore")
-
-sys.path.insert(0, "pipeline")
 
 TOKENS = 100
 WARMUP = 3
@@ -59,53 +54,50 @@ def bench_pytorch_hf():
 
 
 def bench_tts_pipeline():
-    import numpy as np
-    from tts_service import MegakernelTTSService
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    SAMPLE_RATE = 24000
-    svc = MegakernelTTSService(verbose=False)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen3-0.6B", torch_dtype=torch.bfloat16, device_map="cuda",
+        attn_implementation="sdpa",
+    )
+    model.eval()
+    input_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.cuda()
 
     def run():
-        pcm_queue = queue.Queue()
-        t = threading.Thread(target=svc.synthesize, args=(PROMPT, pcm_queue), daemon=True)
-        t.start()
-        chunks = []
-        while True:
-            pcm = pcm_queue.get()
-            if pcm is None:
-                break
-            chunks.append(pcm)
-        t.join()
-        import numpy as np
-        audio_duration = len(np.concatenate(chunks)) / SAMPLE_RATE
-        codec_tokens = audio_duration * 12  # 12 Hz tokenizer
-        return codec_tokens
+        with torch.no_grad():
+            model.generate(
+                input_ids,
+                max_new_tokens=TOKENS,
+                do_sample=False,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
 
-    # warmup
     for _ in range(WARMUP):
         run()
     torch.cuda.synchronize()
 
     times = []
-    codec_tokens = None
     for _ in range(RUNS):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        codec_tokens = run()
+        run()
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
 
     avg = sum(times) / len(times)
-    tok_s = codec_tokens / avg
-    ms_tok = avg * 1000 / codec_tokens
-    return tok_s, ms_tok
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return TOKENS / avg, avg * 1000 / TOKENS
 
 
 if __name__ == "__main__":
-    print("PyTorch (HF) baseline...")
+    print("PyTorch (HF)...")
     hf_tok, hf_ms = bench_pytorch_hf()
 
-    print("Qwen3-TTS pipeline...")
+    print("Qwen3-TTS pipeline (sdpa)...")
     tts_tok, tts_ms = bench_tts_pipeline()
 
     speedup = tts_tok / hf_tok
