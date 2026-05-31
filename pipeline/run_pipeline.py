@@ -24,6 +24,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.run import main as runner_main
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -46,12 +47,21 @@ transport_params = {
 }
 
 
+class TranscriptionLogger(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            logger.info(f"Transcription: {frame.text!r}")
+        await self.push_frame(frame, direction)
+
+
 # ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    transcription_logger = TranscriptionLogger()
     llm = GoogleLLMService(
         api_key=os.getenv("GEMINI_API_KEY"),
         settings=GoogleLLMService.Settings(
@@ -64,6 +74,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline = Pipeline([
         transport.input(),
         stt,
+        transcription_logger,
         llm,
         tts,
         transport.output(),
