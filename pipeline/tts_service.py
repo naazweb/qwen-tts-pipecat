@@ -20,7 +20,7 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.tts_service import TTSService
+from pipecat.services.tts_service import TTSService, TextAggregationMode
 
 os.environ.setdefault("HF_HOME", "/workspace/.hf_home")
 
@@ -49,73 +49,48 @@ class MegakernelTTSService:
             model_name,
             device_map=device,
             dtype=torch.bfloat16,
+            attn_implementation="sdpa",
         )
 
     def synthesize(self, text: str, pcm_queue: _queue.Queue) -> None:
-        """Runs entirely in a background thread. Streams PCM chunks into pcm_queue as tokens are generated."""
+        """Runs entirely in a background thread. Puts np.ndarray chunks into pcm_queue, then None sentinel."""
         import torch
 
         t0 = time.perf_counter()
         first = True
-        buf = []  # accumulates codec token rows (each shape: num_codebooks)
+
+        logger.debug(f"synthesize: starting generation for {text!r}")
+        talker_codes, _ = self.model.model.generate(
+            input_ids=[self._encode(text)],
+            languages=[self.language],
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            repetition_penalty=1.05,
+            subtalker_dosample=True,
+            subtalker_temperature=0.9,
+            subtalker_top_k=50,
+            subtalker_top_p=1.0,
+            max_new_tokens=4096,
+        )
+
+        codes = talker_codes[0]
+        logger.debug(f"synthesize: generation done, {codes.shape[0]} tokens, decoding {codes.shape[0] // CHUNK_FRAMES} chunks")
+
         chunk_count = 0
-        talker = self.model.model.talker
-        original_forward = talker.forward
+        for start in range(0, codes.shape[0], CHUNK_FRAMES):
+            chunk = codes[start: start + CHUNK_FRAMES]
+            wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
+            pcm = wavs[0].astype(np.float32)
+            if first:
+                logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
+                first = False
+            chunk_count += 1
+            logger.debug(f"synthesize: decoded chunk #{chunk_count} ({len(pcm)} samples)")
+            pcm_queue.put(pcm)
 
-        def _patched_forward(*args, **kwargs):
-            nonlocal first, buf, chunk_count
-            out = original_forward(*args, **kwargs)
-            # Only intercept decode steps (generation_step > 0), not prefill
-            codec_ids = out.hidden_states[1] if (out.hidden_states is not None and isinstance(out.hidden_states, tuple)) else None
-            if codec_ids is not None and out.generation_step is not None and out.generation_step > 0:
-                buf.append(codec_ids[0].cpu())  # shape: (num_codebooks,)
-                if len(buf) >= CHUNK_FRAMES:
-                    chunk = torch.stack(buf)  # (CHUNK_FRAMES, num_codebooks)
-                    buf = []
-                    try:
-                        wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
-                        pcm = wavs[0].astype(np.float32)
-                        if first:
-                            logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
-                            first = False
-                        chunk_count += 1
-                        logger.debug(f"synthesize: streaming chunk #{chunk_count} ({len(pcm)} samples)")
-                        pcm_queue.put(pcm)
-                    except Exception as e:
-                        logger.warning(f"synthesize: decode error on chunk #{chunk_count + 1}: {e}")
-            return out
-
-        logger.debug(f"synthesize: starting streaming generation for {text!r}")
-        talker.forward = _patched_forward
-        try:
-            self.model.model.generate(
-                input_ids=[self._encode(text)],
-                languages=[self.language],
-                do_sample=True,
-                temperature=0.9,
-                top_k=50,
-                top_p=1.0,
-                repetition_penalty=1.05,
-                subtalker_dosample=True,
-                subtalker_temperature=0.9,
-                subtalker_top_k=50,
-                subtalker_top_p=1.0,
-                max_new_tokens=4096,
-            )
-        finally:
-            talker.forward = original_forward
-
-        # flush remaining tokens
-        if buf:
-            chunk = torch.stack(buf)
-            try:
-                wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
-                pcm_queue.put(wavs[0].astype(np.float32))
-                logger.debug(f"synthesize: flushed {len(buf)} remaining tokens")
-            except Exception as e:
-                logger.warning(f"synthesize: flush decode error: {e}")
-
-        logger.debug(f"synthesize: done, {chunk_count} chunks streamed")
+        logger.debug(f"synthesize: done, {chunk_count} chunks queued")
         pcm_queue.put(None)
 
     def _encode(self, text: str):
@@ -134,7 +109,7 @@ class QwenTTSService(TTSService):
         device: str = "cuda",
         **kwargs,
     ):
-        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=False, **kwargs)
+        super().__init__(sample_rate=SAMPLE_RATE, push_stop_frames=False, text_aggregation_mode=TextAggregationMode.SENTENCE, **kwargs)
         self._model_name = model_name
         self._language = language
         self._device = device
