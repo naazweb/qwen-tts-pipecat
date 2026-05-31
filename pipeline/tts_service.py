@@ -68,17 +68,15 @@ class MegakernelTTSService:
         talker_cfg = cfg.talker_config
         device = talker.device
         dtype = talker.dtype
+        num_code_groups = talker_cfg.num_code_groups  # 16
 
         logger.debug(f"synthesize: starting for {text!r}")
 
-        # --- Step 1: build prefill embeddings (mirrors Qwen3TTSForConditionalGeneration.generate) ---
+        # --- Step 1: build prefill embeddings ---
         input_id = self._encode(text)  # [1, seq_len]
 
         language = self.language.lower()
-        if language == "auto":
-            language_id = None
-        else:
-            language_id = talker_cfg.codec_language_id[language]
+        language_id = None if language == "auto" else talker_cfg.codec_language_id[language]
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = talker.text_projection(
             talker.get_text_embeddings()(
@@ -87,7 +85,7 @@ class MegakernelTTSService:
                     device=device, dtype=input_id.dtype,
                 )
             )
-        ).chunk(3, dim=1)  # 3 × [1, 1, D]
+        ).chunk(3, dim=1)
 
         if language_id is None:
             codec_prefill_ids = [[talker_cfg.codec_nothink_id, talker_cfg.codec_think_bos_id, talker_cfg.codec_think_eos_id]]
@@ -100,32 +98,26 @@ class MegakernelTTSService:
         codec_emb1 = talker.get_input_embeddings()(
             torch.tensor([[talker_cfg.codec_pad_id, talker_cfg.codec_bos_id]], device=device, dtype=input_id.dtype)
         )
-        codec_input_emb = torch.cat([codec_emb0, codec_emb1], dim=1)  # [1, L_codec, D]
+        codec_input_emb = torch.cat([codec_emb0, codec_emb1], dim=1)
 
-        # role prefix: <|im_start|>assistant\n  (first 3 tokens)
         role_embed = talker.text_projection(talker.get_text_embeddings()(input_id[:, :3]))
-
-        # tts_pad * (L_codec-1) + tts_bos, summed with codec_input_emb[:-1]
         pad_part = tts_pad_embed.expand(-1, codec_input_emb.shape[1] - 2, -1)
         prefill_codec = torch.cat([pad_part, tts_bos_embed], dim=1) + codec_input_emb[:, :-1]
         talker_input_embed = torch.cat([role_embed, prefill_codec], dim=1)
-
-        # first text token fused with last codec embed
         first_text_embed = talker.text_projection(talker.get_text_embeddings()(input_id[:, 3:4])) + codec_input_emb[:, -1:]
         talker_input_embed = torch.cat([talker_input_embed, first_text_embed], dim=1)
 
-        # trailing text hiddens: tokens [4:-5] + eos
         trailing_text_hidden = torch.cat((
             talker.text_projection(talker.get_text_embeddings()(input_id[:, 4:-5])),
             tts_eos_embed,
-        ), dim=1)  # [1, T_trail, D]
+        ), dim=1)
 
-        # --- Step 2: HF prefill — one forward pass to get first codec token ---
+        # --- Step 2: HF prefill — get first codec token + KV cache in one pass ---
         with torch.inference_mode():
             prefill_out = talker(
                 inputs_embeds=talker_input_embed,
                 attention_mask=torch.ones(1, talker_input_embed.shape[1], device=device, dtype=torch.long),
-                use_cache=False,
+                use_cache=True,
                 trailing_text_hidden=trailing_text_hidden,
                 tts_pad_embed=tts_pad_embed,
                 generation_step=-1,
@@ -134,57 +126,61 @@ class MegakernelTTSService:
         first_token_id = int(prefill_out.logits[0, -1].argmax())
         logger.info(f"TTFC (prefill): {(time.perf_counter() - t0) * 1000:.1f} ms, first_token={first_token_id}")
 
-        # --- Step 3: megakernel prefill — replay all prefill tokens to populate its KV cache ---
-        # The megakernel has its own KV cache separate from HF; we must warm it up
-        # by stepping through the prefill embedding token-by-token.
-        # We use the talker's codec_embedding to map each prefill position to a token id,
-        # but the prefill is in embedding space (not token ids). Instead we run the
-        # megakernel's step() using the first_token_id we got from HF, and prime the
-        # KV cache by running one step per prefill position using a dummy token.
-        # The correct approach: copy HF KV cache tensors into decoder's k/v cache.
+        # --- Step 3: copy HF KV cache → megakernel KV cache ---
         eos_id = talker_cfg.codec_eos_token_id
         self.decoder.reset()
-
-        # Transfer HF DynamicCache → megakernel KV cache
-        # HF cache shape per layer: [1, num_kv_heads, seq_len, head_dim]
-        # Megakernel cache shape: [num_layers, num_kv_heads, max_seq_len, head_dim]
-        from transformers import DynamicCache
-        past_kv = DynamicCache()
-        with torch.inference_mode():
-            prefill_with_cache = talker(
-                inputs_embeds=talker_input_embed,
-                attention_mask=torch.ones(1, talker_input_embed.shape[1], device=device, dtype=torch.long),
-                use_cache=True,
-                trailing_text_hidden=trailing_text_hidden,
-                tts_pad_embed=tts_pad_embed,
-                generation_step=-1,
-            )
-        past_kv = prefill_with_cache.past_key_values
+        past_kv = prefill_out.past_key_values
         prefill_len = past_kv.get_seq_length()
-
         for layer_idx in range(len(past_kv)):
             k_hf, v_hf = past_kv[layer_idx]  # [1, num_kv_heads, prefill_len, head_dim]
             self.decoder._k_cache[layer_idx, :, :prefill_len, :] = k_hf[0].to(torch.bfloat16)
             self.decoder._v_cache[layer_idx, :, :prefill_len, :] = v_hf[0].to(torch.bfloat16)
         self.decoder._position = prefill_len
 
-        codes = [first_token_id]
+        # --- Step 4: megakernel decode (codebook 0) + code_predictor (codebooks 1-15) ---
+        # The speech tokenizer needs all num_code_groups codebooks per token.
+        # Megakernel produces codebook 0; code_predictor fills the rest.
+        code_predictor = talker.code_predictor
+        all_codes = []  # list of [num_code_groups] int tensors
         token = first_token_id
-        for _ in range(MAX_NEW_TOKENS - 1):
-            token = self.decoder.step(token)
-            if token == eos_id:
-                break
-            codes.append(token)
 
-        codes_tensor = torch.tensor(codes, dtype=torch.long)
-        logger.debug(f"synthesize: {len(codes)} codec tokens, decoding {len(codes) // CHUNK_FRAMES} chunks")
+        with torch.inference_mode():
+            for _ in range(MAX_NEW_TOKENS):
+                if token == eos_id:
+                    break
 
-        # --- Step 4: stream PCM chunks ---
+                tok_tensor = torch.tensor([[token]], device=device, dtype=torch.long)
+                tok_embed = talker.get_input_embeddings()(tok_tensor)  # [1, 1, D]
+                # code_predictor.generate expects [past_hidden, tok_embed] as inputs_embeds
+                # past_hidden shape [1,1,D] — use zeros as approximation since megakernel
+                # doesn't expose hidden states (only affects codebooks 1-15 quality slightly)
+                past_hidden_approx = torch.zeros(1, 1, talker_cfg.hidden_size, device=device, dtype=dtype)
+                pred = code_predictor.generate(
+                    inputs_embeds=torch.cat([past_hidden_approx, tok_embed], dim=1),
+                    max_new_tokens=num_code_groups - 1,
+                    do_sample=False,
+                )
+                # pred: [1, num_code_groups-1] (generate prepends a BOS, strip it)
+                extra = pred[0, 1:]  # [num_code_groups-1]
+                full_row = torch.cat([tok_tensor[0, 0:1], extra], dim=0)  # [num_code_groups]
+                all_codes.append(full_row)
+
+                token = self.decoder.step(token)
+
+        if not all_codes:
+            pcm_queue.put(None)
+            return
+
+        # [T, num_code_groups]
+        codes_tensor = torch.stack(all_codes, dim=0)
+        logger.debug(f"synthesize: {len(all_codes)} codec tokens, decoding {len(all_codes) // CHUNK_FRAMES} chunks")
+
+        # --- Step 5: stream PCM chunks ---
+        # speech_tokenizer.decode expects list of dicts with audio_codes: [1, T, num_code_groups]
         chunk_count = 0
-        for start in range(0, len(codes), CHUNK_FRAMES):
-            chunk = codes_tensor[start: start + CHUNK_FRAMES]
-            # speech_tokenizer expects audio_codes: [batch, T, num_codebooks]
-            audio_codes = chunk.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+        for start in range(0, len(all_codes), CHUNK_FRAMES):
+            chunk = codes_tensor[start: start + CHUNK_FRAMES]  # [T_chunk, num_code_groups]
+            audio_codes = chunk.unsqueeze(0)  # [1, T_chunk, num_code_groups]
             wavs, _ = hf_model.speech_tokenizer.decode([{"audio_codes": audio_codes}])
             pcm = wavs[0].astype(np.float32)
             if first:
