@@ -120,34 +120,53 @@ class MegakernelTTSService:
             tts_eos_embed,
         ), dim=1)  # [1, T_trail, D]
 
-        # --- Step 2: HF prefill — one forward pass, no token generated yet ---
-        from transformers import DynamicCache
-        past_kv = DynamicCache()
-        attention_mask = torch.ones(1, talker_input_embed.shape[1], device=device, dtype=torch.long)
-
+        # --- Step 2: HF prefill — one forward pass to get first codec token ---
         with torch.inference_mode():
             prefill_out = talker(
                 inputs_embeds=talker_input_embed,
-                attention_mask=attention_mask,
-                past_key_values=past_kv,
-                use_cache=True,
+                attention_mask=torch.ones(1, talker_input_embed.shape[1], device=device, dtype=torch.long),
+                use_cache=False,
                 trailing_text_hidden=trailing_text_hidden,
                 tts_pad_embed=tts_pad_embed,
                 generation_step=-1,
             )
 
-        # prefill_out.logits: [1, seq_len, vocab] — last position is the first codec token
         first_token_id = int(prefill_out.logits[0, -1].argmax())
-        past_kv = prefill_out.past_key_values
-        past_hidden = prefill_out.past_hidden  # [1, 1, D] — last hidden state
-
         logger.info(f"TTFC (prefill): {(time.perf_counter() - t0) * 1000:.1f} ms, first_token={first_token_id}")
 
-        # --- Step 3: megakernel autoregressive decode ---
+        # --- Step 3: megakernel prefill — replay all prefill tokens to populate its KV cache ---
+        # The megakernel has its own KV cache separate from HF; we must warm it up
+        # by stepping through the prefill embedding token-by-token.
+        # We use the talker's codec_embedding to map each prefill position to a token id,
+        # but the prefill is in embedding space (not token ids). Instead we run the
+        # megakernel's step() using the first_token_id we got from HF, and prime the
+        # KV cache by running one step per prefill position using a dummy token.
+        # The correct approach: copy HF KV cache tensors into decoder's k/v cache.
         eos_id = talker_cfg.codec_eos_token_id
         self.decoder.reset()
-        # prime the KV cache position counter to match prefill length
-        self.decoder._position = past_kv.get_seq_length()
+
+        # Transfer HF DynamicCache → megakernel KV cache
+        # HF cache shape per layer: [1, num_kv_heads, seq_len, head_dim]
+        # Megakernel cache shape: [num_layers, num_kv_heads, max_seq_len, head_dim]
+        from transformers import DynamicCache
+        past_kv = DynamicCache()
+        with torch.inference_mode():
+            prefill_with_cache = talker(
+                inputs_embeds=talker_input_embed,
+                attention_mask=torch.ones(1, talker_input_embed.shape[1], device=device, dtype=torch.long),
+                use_cache=True,
+                trailing_text_hidden=trailing_text_hidden,
+                tts_pad_embed=tts_pad_embed,
+                generation_step=-1,
+            )
+        past_kv = prefill_with_cache.past_key_values
+        prefill_len = past_kv.get_seq_length()
+
+        for layer_idx in range(len(past_kv)):
+            k_hf, v_hf = past_kv[layer_idx]  # [1, num_kv_heads, prefill_len, head_dim]
+            self.decoder._k_cache[layer_idx, :, :prefill_len, :] = k_hf[0].to(torch.bfloat16)
+            self.decoder._v_cache[layer_idx, :, :prefill_len, :] = v_hf[0].to(torch.bfloat16)
+        self.decoder._position = prefill_len
 
         codes = [first_token_id]
         token = first_token_id
@@ -164,7 +183,9 @@ class MegakernelTTSService:
         chunk_count = 0
         for start in range(0, len(codes), CHUNK_FRAMES):
             chunk = codes_tensor[start: start + CHUNK_FRAMES]
-            wavs, _ = hf_model.speech_tokenizer.decode([{"audio_codes": chunk}])
+            # speech_tokenizer expects audio_codes: [batch, T, num_codebooks]
+            audio_codes = chunk.unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+            wavs, _ = hf_model.speech_tokenizer.decode([{"audio_codes": audio_codes}])
             pcm = wavs[0].astype(np.float32)
             if first:
                 logger.info(f"TTFC (first audio): {(time.perf_counter() - t0) * 1000:.1f} ms")
