@@ -8,7 +8,7 @@ import sys
 import time
 import threading
 import queue as _queue
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator
 
 import numpy as np
 from loguru import logger
@@ -51,73 +51,46 @@ class MegakernelTTSService:
             dtype=torch.bfloat16,
         )
 
-    def synthesize(self, text: str) -> Generator[np.ndarray, None, None]:
+    def synthesize(self, text: str, pcm_queue: _queue.Queue) -> None:
+        """Runs entirely in a background thread. Puts np.ndarray chunks into pcm_queue, then None sentinel."""
         import torch
 
         t0 = time.perf_counter()
         first = True
-        token_queue: _queue.Queue = _queue.Queue()
 
-        class _CodeStreamer:
-            def put(self, value):
-                toks = value.squeeze(0) if value.dim() > 1 else value
-                for tok in toks.tolist():
-                    token_queue.put(tok)
+        logger.debug(f"synthesize: starting generation for {text!r}")
+        talker_codes, _ = self.model.model.generate(
+            input_ids=[self._encode(text)],
+            languages=[self.language],
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+            repetition_penalty=1.05,
+            subtalker_dosample=True,
+            subtalker_temperature=0.9,
+            subtalker_top_k=50,
+            subtalker_top_p=1.0,
+            max_new_tokens=4096,
+        )
 
-            def end(self):
-                token_queue.put(None)
+        codes = talker_codes[0]
+        logger.debug(f"synthesize: generation done, {codes.shape[0]} tokens, decoding {codes.shape[0] // CHUNK_FRAMES} chunks")
 
-        streamer = _CodeStreamer()
-
-        def _run_generate():
-            self.model.model.generate(
-                input_ids=[self._encode(text)],
-                languages=[self.language],
-                streamer=streamer,
-                do_sample=True,
-                temperature=0.9,
-                top_k=50,
-                top_p=1.0,
-                repetition_penalty=1.05,
-                subtalker_dosample=True,
-                subtalker_temperature=0.9,
-                subtalker_top_k=50,
-                subtalker_top_p=1.0,
-                max_new_tokens=4096,
-            )
-
-        logger.debug(f"synthesize: starting generation thread for {text!r}")
-        t = threading.Thread(target=_run_generate, daemon=True)
-        t.start()
-
-        buf = []
         chunk_count = 0
-        while True:
-            tok = token_queue.get()
-            if tok is None:
-                logger.debug(f"synthesize: generation complete, {chunk_count} chunks yielded")
-                break
-            buf.append(tok)
-            if len(buf) >= CHUNK_FRAMES:
-                chunk = torch.tensor(buf, dtype=torch.long).unsqueeze(0)
-                wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
-                pcm = wavs[0].astype(np.float32)
-                if first:
-                    logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
-                    first = False
-                buf = []
-                chunk_count += 1
-                logger.debug(f"synthesize: yielding chunk #{chunk_count} ({len(pcm)} samples)")
-                yield pcm
-
-        if buf:
-            logger.debug(f"synthesize: flushing {len(buf)} remaining tokens")
-            chunk = torch.tensor(buf, dtype=torch.long).unsqueeze(0)
+        for start in range(0, codes.shape[0], CHUNK_FRAMES):
+            chunk = codes[start: start + CHUNK_FRAMES]
             wavs, _ = self.model.model.speech_tokenizer.decode([{"audio_codes": chunk}])
-            yield wavs[0].astype(np.float32)
+            pcm = wavs[0].astype(np.float32)
+            if first:
+                logger.info(f"TTFC: {(time.perf_counter() - t0) * 1000:.1f} ms")
+                first = False
+            chunk_count += 1
+            logger.debug(f"synthesize: decoded chunk #{chunk_count} ({len(pcm)} samples)")
+            pcm_queue.put(pcm)
 
-        t.join()
-        logger.debug(f"synthesize: generation thread joined")
+        logger.debug(f"synthesize: done, {chunk_count} chunks queued")
+        pcm_queue.put(None)
 
     def _encode(self, text: str):
         import torch
@@ -161,19 +134,17 @@ class QwenTTSService(TTSService):
             yield TTSStartedFrame(context_id=context_id)
 
             loop = asyncio.get_running_loop()
-            queue: asyncio.Queue = asyncio.Queue()
+            pcm_queue: _queue.Queue = _queue.Queue()
 
             def _generate():
-                for pcm in self._tts.synthesize(text):
-                    loop.call_soon_threadsafe(queue.put_nowait, pcm)
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                self._tts.synthesize(text, pcm_queue)
 
             loop.run_in_executor(None, _generate)
 
             first = True
             frame_count = 0
             while True:
-                pcm = await queue.get()
+                pcm = await loop.run_in_executor(None, pcm_queue.get)
                 if pcm is None:
                     logger.info(f"run_tts: done, pushed {frame_count} audio frames")
                     break
