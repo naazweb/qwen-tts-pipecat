@@ -20,7 +20,7 @@ from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -92,8 +92,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
-        context.add_message({"role": "user", "content": "Please introduce yourself to the user."})
-        await worker.queue_frames([LLMRunFrame()])
+        await worker.queue_frames([TTSSpeakFrame("Hi! I'm your voice assistant. How can I help you today?")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
