@@ -33,6 +33,7 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.google.vertex.llm import GoogleLLMService
 from pipecat.transports.base_transport import BaseTransport
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
@@ -57,10 +58,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    llm = OpenAILLMService(
+    llm = GoogleLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
-        settings=OpenAILLMService.Settings(
-            model="gpt-4o-mini",
+        settings=GoogleLLMService.Settings(
+            model="gemini-2.5-flash",
             system_instruction="You are a helpful voice assistant. Keep responses concise and conversational. Do not use special characters or markdown.",
         ),
     )
